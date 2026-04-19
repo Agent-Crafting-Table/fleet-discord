@@ -540,12 +540,10 @@ if (FLEET_SESSION) {
   }, 15_000).unref()
 
   // Graceful code-roll: every 30s, check if our own source on disk has
-  // been replaced (fleet-sync rewriting it). When it has AND we're idle,
-  // exit cleanly so Claude Code's MCP supervisor respawns us with new
-  // code. Replaces the old `pkill -f 'bun server.ts'` watchdog approach,
-  // which kill-blasted all 4 sessions and frequently left them dead.
-  // Sessions check independently with naturally-staggered tick phases,
-  // so rolls drain one-at-a-time across the fleet.
+  // been replaced (fleet-sync rewriting it). When idle, exit so the outer
+  // bash restart loop (in package.json start script) relaunches bun with the
+  // new code within ~0.5s. The restart loop holds the MCP pipe open so
+  // Claude Code never sees a disconnect.
   const FLEET_SOURCE_PATH = import.meta.path
   let FLEET_SOURCE_MTIME = 0
   try { FLEET_SOURCE_MTIME = statSync(FLEET_SOURCE_PATH).mtimeMs } catch {}
@@ -557,7 +555,10 @@ if (FLEET_SESSION) {
     // next tick; cooldownUntil rolls in after reply lands.
     const selfBusy = fleetReadBusy(FLEET_SESSION!)
     if (selfBusy && (!selfBusy.cooldownUntil || Date.now() < selfBusy.cooldownUntil)) return
-    process.stderr.write(`[fleet] source changed (mtime ${FLEET_SOURCE_MTIME} → ${m}); exiting 0 for clean respawn\n`)
+    process.stderr.write(`[fleet] source changed (mtime ${FLEET_SOURCE_MTIME} → ${m}); exiting for restart loop\n`)
+    // Exit so the outer restart loop (in package.json start script) immediately
+    // relaunches bun with the new code. The restart loop keeps Claude Code's
+    // MCP pipe alive across the restart — no supervisor dependency.
     process.exit(0)
   }, 30_000).unref()
 }

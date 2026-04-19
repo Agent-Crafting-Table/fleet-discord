@@ -1,0 +1,14 @@
+{
+  "name": "claude-channel-discord",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "bun install --no-summary && sh -c 'while true; do bun server.ts; sleep 0.5; done'"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "discord.js": "^14.14.0"
+  }
+}
