@@ -572,6 +572,10 @@ type GateResult =
 const recentSentIds = new Set<string>()
 const RECENT_SENT_CAP = 200
 
+// Tier-2 streaming: tracks the last bot message id per chat_id that
+// was posted via post_update. Cleared when a real reply lands.
+const activeWorkingMsg = new Map<string, string>()
+
 function noteSent(id: string): void {
   recentSentIds.add(id)
   if (recentSentIds.size > RECENT_SENT_CAP) {
@@ -990,6 +994,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'post_update',
+      description:
+        'Post an intermediate progress update during a multi-step task. If a working-message already exists for this chat_id, edits it in-place (silent — no push notification). Otherwise posts a new message and remembers it. Cleared automatically when reply() lands. Use after each significant step to narrate what you found and what you\'re doing next. Do NOT use for the final answer — use reply() for that.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          text: { type: 'string' },
+        },
+        required: ['chat_id', 'text'],
+      },
+    },
+    {
       name: 'download_attachment',
       description: 'Download attachments from a specific Discord message to the local inbox. Use after fetch_messages shows a message has attachments (marked with +Natt). Returns file paths ready to Read.',
       inputSchema: {
@@ -1035,6 +1052,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         // Stop typing indicator — reply is about to land
         stopTyping(chat_id)
+        // Clear any working-message state — the real reply supersedes it
+        activeWorkingMsg.delete(chat_id)
 
         for (const f of files) {
           assertSendable(f)
@@ -1130,6 +1149,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const msg = await ch.messages.fetch(args.message_id as string)
         const edited = await msg.edit(args.text as string)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
+      }
+      case 'post_update': {
+        const chat_id = args.chat_id as string
+        const text = args.text as string
+        const ch = await fetchAllowedChannel(chat_id)
+        if (!('send' in ch)) throw new Error('channel is not sendable')
+
+        const existingId = activeWorkingMsg.get(chat_id)
+        if (existingId) {
+          try {
+            const prev = await ch.messages.fetch(existingId)
+            const edited = await prev.edit(text)
+            return { content: [{ type: 'text', text: `updated working message (id: ${edited.id})` }] }
+          } catch {
+            // Message may have been deleted — fall through to post a new one
+          }
+        }
+        const sent = await ch.send({ content: text })
+        noteSent(sent.id)
+        activeWorkingMsg.set(chat_id, sent.id)
+        return { content: [{ type: 'text', text: `posted working message (id: ${sent.id})` }] }
       }
       case 'download_attachment': {
         const ch = await fetchAllowedChannel(args.chat_id as string)
@@ -1357,6 +1397,7 @@ async function handleInbound(msg: Message): Promise<void> {
         ...(history ? { channel_history: history } : {}),
         ...(memory ? { channel_memory: memory.slice(0, 4000) } : {}),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+        instructions: 'For multi-step tasks (SSH, file reads, searches, API calls, etc.), call post_update(chat_id, text) after each significant step to narrate progress. This edits a single working message silently — no ping until reply() lands. Use reply() only for the final answer.',
       },
     },
   }).catch(err => {
