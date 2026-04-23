@@ -2,7 +2,7 @@
 
 Run multiple concurrent Claude Code sessions sharing one Discord bot, with peer-to-peer claim routing, busy-isolation, and a stuck-task watchdog.
 
-> Part of [The Agent Crafting Table](https://github.com/The-Agent-Crafting-Table) — standalone agent system components for Claude Code.
+> Part of [The Agent Crafting Table](https://github.com/Agent-Crafting-Table) — standalone agent system components for Claude Code.
 
 ## What This Solves
 
