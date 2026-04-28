@@ -12,16 +12,19 @@ Stock Claude Code fans out every Discord message to every session — so four se
 - **Sticky routing** — regular users consistently land on their preferred session
 - **Self-respawn** — code rolls happen gracefully, no container restarts needed
 - **Stuck-task watchdog** — synthetic reminders if a session wins a claim but never replies
+- **Trivial-message reactions** — acks like "ok"/"thanks" and emoji-only replies get a reaction instead of spinning up a Claude session
 
 ## Files
 
 ```
 src/
-  server.ts               # Drop-in replacement for claude-plugins-official/discord/server.ts
-  fleet-sync-plugin.sh    # Idempotent sync to all per-session plugin dirs
-  restart-loop-fleet.sh   # Per-session supervisor with session-id persistence
+  server.ts                       # Drop-in replacement for claude-plugins-official/discord/server.ts
+  trivial-classifier.js           # Classifies acks/emoji-only messages → react and skip
+  trivial-classifier.test.mjs     # Tests for the classifier (node, no deps)
+  fleet-sync-plugin.sh            # Idempotent sync to all per-session plugin dirs
+  restart-loop-fleet.sh           # Per-session supervisor with session-id persistence
 assets/
-  start-sh-snippet.sh     # Boot script wiring — adapt and paste into your start.sh
+  start-sh-snippet.sh             # Boot script wiring — adapt and paste into your start.sh
 ```
 
 ## Requirements
@@ -91,6 +94,18 @@ export CLAUDE_FLEET_LONG_LIVED=1   # activates fleet code path
 7. **Reply tool fires** → busy lock updated with `cooldownUntil = now + 60s`.
 8. **Reminder watchdog** ticks every 15s — if no `cooldownUntil` after 90s, emits a soft reminder; at 5 min, a hard escalation.
 9. **Self-respawn**: each bun checks its own source file mtime and self-exits when idle + changed. Sessions roll one at a time, no in-flight reply ever cancelled.
+
+## Trivial-Message Filter
+
+Before the fleet claim, every inbound message runs through `trivial-classifier.js`. If it's a low-content ack (`"ok"`, `"thanks"`, `"got it"`, `"lol"`...) or an emoji-only reply (`"👍"`, `"🔥🔥"`), the bot reacts with 👍 or 👀 and returns — no Claude session spin.
+
+Conservative by design: anything with a `?`, an `@mention`, an attachment, a `/slash-command`, or longer than 30 chars falls through to the model. Adjust the `TRIVIAL_ACKS` set or `MAX_LENGTH` in `src/trivial-classifier.js` if you want different behavior.
+
+Run the tests:
+
+```bash
+node src/trivial-classifier.test.mjs
+```
 
 ## Tuning
 

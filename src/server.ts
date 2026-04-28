@@ -39,6 +39,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import { classify as classifyTrivial } from './trivial-classifier.js'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -1329,6 +1330,20 @@ async function handleInbound(msg: Message): Promise<void> {
     })
     const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
     void msg.react(emoji).catch(() => {})
+    return
+  }
+
+  // Trivial-message classifier: drops greetings, acks, and emoji-only
+  // replies before the fleet claim. Reacts with an emoji and returns —
+  // saves the cost of a Claude session spin just to say "👍". Conservative
+  // by design: when in doubt, falls through and lets the model see it.
+  const trivial = classifyTrivial({
+    content: msg.content,
+    hasAttachments: msg.attachments.size > 0,
+    hasMentions: msg.mentions.users.size > 0 || msg.mentions.roles.size > 0,
+  })
+  if (trivial.trivial) {
+    if (trivial.reaction) void msg.react(trivial.reaction).catch(() => {})
     return
   }
 
