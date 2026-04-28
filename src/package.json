@@ -5,7 +5,8 @@
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
-    "start": "bun install --no-summary && sh -c 'while true; do bun server.ts; sleep 0.5; done'"
+    "start": "bun install --no-summary && sh -c 'while true; do bun server.ts; sleep 0.5; done'",
+    "test": "node trivial-classifier.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
