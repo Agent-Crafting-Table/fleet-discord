@@ -4,6 +4,53 @@ Run multiple concurrent Claude Code sessions sharing one Discord bot, with peer-
 
 > Part of [The Agent Crafting Table](https://github.com/Agent-Crafting-Table) — standalone agent system components for Claude Code.
 
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant D as Discord
+    participant B as Bun Plugin (all sessions)
+    participant TC as Trivial Classifier
+    participant FL as Fleet Router
+    participant S1 as Session A (sticky)
+    participant S2 as Session B
+    participant S3 as Session C
+
+    D->>B: Inbound message (all sessions see it)
+    B->>TC: Classify message
+    alt trivial ack / emoji-only
+        TC-->>D: 👍 react, skip
+    else real message
+        TC->>FL: fleetMyDelayMs()
+        FL->>FL: check peer busy files
+        Note over FL: Session A: sticky idle → 0ms<br/>Session B: sticky present → 400ms delay<br/>Session C: busy on other chat → 1500ms delay
+        FL->>S1: fleetTryClaim() + jitter (0ms)
+        S1->>S1: atomic mkdirSync claim
+        S1-->>S2: claim file exists → S2 stands down
+        S1-->>S3: claim file exists → S3 stands down
+        S1->>S1: write busy lock
+        S1->>D: discord:reply → cooldownUntil = now+60s
+    end
+```
+
+```mermaid
+flowchart TD
+    A[Bot boots] --> B[fleet-sync-plugin.sh
+syncs server.ts to all session dirs]
+    B --> C[Watchdog window
+re-syncs every 5 min]
+    C -->|mtime changed| D[bun self-exits on idle tick]
+    D --> E[sh restart loop relaunches bun
+with new code, same MCP pipe]
+
+    subgraph Stuck-Task Watchdog
+        F[claim won, reply not fired]
+        F -->|90s| G[soft reminder injected into Claude context]
+        G -->|5 min| H[hard escalation — call discord:reply NOW]
+        H -->|reply fires| I[pendingReply cleared, watchdog stops]
+    end
+```
+
 ## What This Solves
 
 Stock Claude Code fans out every Discord message to every session — so four sessions means four duplicate replies. This replaces the default Discord plugin with a peer-to-peer router that guarantees exactly one reply per message, while handling:
