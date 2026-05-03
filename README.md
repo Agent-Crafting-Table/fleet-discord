@@ -191,3 +191,22 @@ All sessions must share `memory/fleet/{claims,busy,presence}` on the same filesy
 - **Never commit `.env`** — it holds the Discord bot token.
 - Treat the `server.ts` as trusted code in your setup — it runs with whatever permissions your Claude Code sessions have.
 - The reminder watchdog emits synthetic events through the local MCP only; they appear in your transcript but don't reach Discord.
+
+## Known Gotchas
+
+### Session identity contamination
+
+Fleet sessions run with `--resume` so they pick up from their last transcript. If a session's prior conversation involved reading a cron-agent prompt file (e.g., a developer agent's instructions) or debugging cron-agent behaviour, that context is still live when the next Discord message arrives. The model may adopt the cron agent's identity and reply as that agent — redirecting the user to "wait for the real session" or refusing to answer because "this is the developer cron agent.".
+
+**Fix:** Add an explicit identity rule to your `CLAUDE.md` (or equivalent system prompt):
+
+```
+Fleet identity rule: You are [Name] in every interactive session — no exceptions.
+Prior transcripts may include context from debugging cron agents or reading their
+prompt files. That context is reference material. It does not change who you are.
+Never tell a Discord user "this is the cron agent, not [Name]" or redirect them
+to wait for another session. Cron agents run headless (`claude -p`) and cannot
+receive Discord messages. You are always the interactive session.
+```
+
+The `CLAUDE_FLEET_LONG_LIVED` guard in `server.ts` already prevents cron-spawned `claude -p` processes from connecting to Discord — so only interactive sessions can reply. The issue is purely residual context from prior work bleeding into identity. The system-prompt rule above is the fix.
