@@ -1,15 +1,20 @@
-#!/usr/bin/env bun
 /**
- * Discord channel for Claude Code — fleet edition.
+ * Discord channel for Claude Code — Node port.
  *
- * Fork of the official discord plugin 0.0.4 (from ~/.claude/plugins/cache/...)
- * with a peer-to-peer claim layer so multiple Claude Code sessions can share
- * the same bot token and channel allowlist without producing duplicate replies.
+ * This is the same fork as the original (a peer-to-peer-claim layer over the
+ * upstream discord plugin 0.0.4) — but ported off bun and onto Node 22+ via
+ * tsx. The bun runtime caused recurring orphan-process pile-ups. Node
+ * cleans up cleanly when its parent dies, so the orphan class of bug is
+ * structurally gone.
+ *
+ * Bun→node delta is tiny: `import.meta.path` → `fileURLToPath(import.meta.url)`,
+ * and the dynamic `require('https')` → top-level ESM import. Everything else
+ * is byte-identical to the bun version, including all fleet logic.
  *
  * Activated per-session by setting FLEET_SESSION_NAME in the plugin env.
  * When unset, behavior is identical to the upstream plugin.
  *
- * State dir (default /workspace/memory/fleet) holds:
+ * State dir (default ~/.claude/channels/discord) holds:
  *   claims/<message_id>/winner   — atomic mkdir lock; winner session name inside
  *   stickiness.json              — last-session-per-channel hint
  *   presence/<session>.json      — heartbeat + pid per session
@@ -36,9 +41,12 @@ import {
   type Interaction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
+import { spawn } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
+import { fileURLToPath } from 'url'
+import * as https from 'https'
 import { classify as classifyTrivial } from './trivial-classifier.js'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
@@ -68,7 +76,12 @@ try {
 // same FLEET_SESSION_NAME from .env), they would otherwise also boot a
 // discord plugin connection and race for messages. Detect that case and
 // exit immediately.
-const FLEET_DIR = process.env.FLEET_STATE_DIR ?? '/workspace/memory/fleet'
+
+// Fleet state dir for claims/busy/presence/stickiness.
+// Default: ~/.claude/fleet  (portable, co-located with the rest of the plugin state).
+// Override: FLEET_STATE_DIR=/your/shared/path
+const FLEET_DIR = process.env.FLEET_STATE_DIR ?? join(homedir(), '.claude', 'fleet')
+
 const FLEET_LONG_LIVED = process.env.CLAUDE_FLEET_LONG_LIVED === '1'
 const FLEET_SESSION = process.env.FLEET_SESSION_NAME && FLEET_LONG_LIVED
   ? process.env.FLEET_SESSION_NAME
@@ -81,7 +94,7 @@ if (process.env.FLEET_SESSION_NAME && !FLEET_LONG_LIVED) {
 }
 
 // Self-exit if our parent process dies (we get reparented to PID 1).
-// Without this, killing claude orphans bun children — they keep running,
+// Without this, killing claude orphans node children — they keep running,
 // stay connected to Discord, and race for messages with the new session.
 setInterval(() => {
   try {
@@ -97,8 +110,17 @@ const FLEET_STICKY_DELAY_MS = Number(process.env.FLEET_STICKY_DELAY_MS ?? 400)
 const FLEET_BUSY_COOLDOWN_MS = Number(process.env.FLEET_BUSY_COOLDOWN_MS ?? 60_000)
 const FLEET_BUSY_DELAY_MS = Number(process.env.FLEET_BUSY_DELAY_MS ?? 1500)
 const FLEET_REMIND_AFTER_MS = Number(process.env.FLEET_REMIND_AFTER_MS ?? 90_000)
-const FLEET_REMIND_ESCALATE_MS = Number(process.env.FLEET_REMIND_ESCALATE_MS ?? 300_000)
+// Re-fires every FLEET_REMIND_ESCALATE_MS after the first soft reminder.
+// Lowered from 300s → 90s so the watchdog nags every ~90s instead of going
+// silent for 5 minutes between soft→hard. Minimum enforced at 60s.
+const FLEET_REMIND_ESCALATE_MS = Math.max(
+  60_000,
+  Number(process.env.FLEET_REMIND_ESCALATE_MS ?? 90_000),
+)
 const FLEET_BUSY_TTL_MS = 30 * 60 * 1000
+const FLEET_NOREPLY_STUCK_MS = 10 * 60 * 1000 // 10 min — sweep a no-reply stuck claim early
+const FLEET_STUCK_CLAIM_MS = 5 * 60 * 1000    // 5 min — peers treat a no-cooldown claim this old as abandoned
+const WARM_WINDOW_MS = 3 * 60 * 1000          // 3 min — post-cooldown warm window; session defers to idle peers
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const STATIC = process.env.DISCORD_ACCESS_MODE === 'static'
@@ -134,6 +156,10 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    // Safe to add even when voice is disabled — just enables the VoiceState
+    // update events Discord already sends. The voice feature itself is gated
+    // behind DISCORD_VOICE_ENABLED=1.
+    GatewayIntentBits.GuildVoiceStates,
   ],
   // DMs arrive as partial channels — messageCreate never fires without this.
   partials: [Partials.Channel],
@@ -411,11 +437,14 @@ function fleetMyDelayMs(chatId: string, sticky: string | undefined): number {
   // Self-busy carve-out: if WE are mid-work on a different chat (and not
   // past cooldown), defer so idle peers grab this. Without this, our own
   // busy state is invisible to our own routing — sticky-self routes back
-  // to us even when occupied. Mirrors peer cooldown semantics on line ~427.
+  // to us even when occupied. Mirrors peer cooldown semantics.
   const selfBusy = fleetReadBusy(FLEET_SESSION)
   if (selfBusy && selfBusy.chatId !== chatId) {
     const stillActive = selfBusy.cooldownUntil ? Date.now() < selfBusy.cooldownUntil : true
-    if (stillActive) return FLEET_BUSY_DELAY_MS
+    const recentlyActive = selfBusy.cooldownUntil
+      ? Date.now() < selfBusy.cooldownUntil + WARM_WINDOW_MS
+      : true  // no cooldown set yet = still active
+    if (stillActive || recentlyActive) return FLEET_BUSY_DELAY_MS
   }
   // Scan all peer busy files. Cheap — at most 4 entries.
   let busyDirEntries: string[] = []
@@ -427,18 +456,30 @@ function fleetMyDelayMs(chatId: string, sticky: string | undefined): number {
     const b = fleetReadBusy(peer)
     if (!b) continue
     if (b.chatId === chatId) {
-      // Peer owns this channel right now (or is in its cooldown window).
-      const cooldownActive = b.cooldownUntil ? Date.now() < b.cooldownUntil : true
-      if (cooldownActive) return FLEET_BUSY_DELAY_MS
+      // Peer owns this channel right now (or is in its cooldown/warm window).
+      // Exception: a no-cooldown claim older than FLEET_STUCK_CLAIM_MS is
+      // treated as abandoned — peers race freely rather than backing off forever.
+      const claimAbandoned = !b.cooldownUntil && (Date.now() - (b.since ?? 0)) > FLEET_STUCK_CLAIM_MS
+      const cooldownActive = claimAbandoned ? false : (b.cooldownUntil ? Date.now() < b.cooldownUntil : true)
+      const warmActive = claimAbandoned ? false : (b.cooldownUntil ? Date.now() < b.cooldownUntil + WARM_WINDOW_MS : true)
+      if (cooldownActive || warmActive) return FLEET_BUSY_DELAY_MS
     }
   }
   if (sticky && sticky !== FLEET_SESSION) {
-    // Sticky peer might be busy elsewhere — if so, drop the head-start delay
-    // (they can't claim two channels at once).
+    // Sticky peer might be busy or warm elsewhere — if so, drop the head-start
+    // delay so idle peers grab this. Without the warm check, the post-cooldown
+    // race fires immediately and routes back to the just-finished session.
     const peerBusy = fleetReadBusy(sticky)
-    if (peerBusy && peerBusy.chatId !== chatId) {
-      const stillCooling = peerBusy.cooldownUntil && Date.now() < peerBusy.cooldownUntil
-      if (!stillCooling) return 0
+    if (peerBusy) {
+      if (peerBusy.chatId !== chatId) {
+        const stillCoolingOrWarm = peerBusy.cooldownUntil && Date.now() < peerBusy.cooldownUntil + WARM_WINDOW_MS
+        if (stillCoolingOrWarm) return 0
+      } else {
+        // Sticky peer owns THIS channel — if its claim is abandoned (no cooldown,
+        // older than FLEET_STUCK_CLAIM_MS), drop its head-start so peers race freely.
+        const stickyAbandoned = !peerBusy.cooldownUntil && (Date.now() - (peerBusy.since ?? 0)) > FLEET_STUCK_CLAIM_MS
+        if (stickyAbandoned) return 0
+      }
     }
     return FLEET_STICKY_DELAY_MS
   }
@@ -490,7 +531,13 @@ if (FLEET_SESSION) {
           const b = JSON.parse(readFileSync(p, 'utf8')) as BusyFile
           const cooldownDone = !b.cooldownUntil || Date.now() > b.cooldownUntil
           const expired = Date.now() - (b.since ?? 0) > FLEET_BUSY_TTL_MS
-          if (cooldownDone && expired) rmSync(p, { force: true })
+          const noReplyStuck = !b.cooldownUntil && (Date.now() - (b.since ?? 0)) > FLEET_NOREPLY_STUCK_MS
+          if (noReplyStuck) {
+            process.stderr.write(`fleet: sweeping no-reply-stuck claim for ${f} (age ${Math.round((Date.now() - (b.since ?? 0)) / 60000)}min, no cooldownUntil)\n`)
+            rmSync(p, { force: true })
+          } else if (cooldownDone && expired) {
+            rmSync(p, { force: true })
+          }
         } catch {
           // Corrupt or unreadable — drop it so peers stop honoring it.
           try { rmSync(p, { force: true }) } catch {}
@@ -501,10 +548,12 @@ if (FLEET_SESSION) {
 
   // Stuck-task watchdog: emit a synthetic reminder back to this session if
   // we've held a busy entry past FLEET_REMIND_AFTER_MS without replying.
-  // Escalates to a stronger reminder at FLEET_REMIND_ESCALATE_MS. Reminders
-  // route through the local mcp connection only — peer sessions never see
-  // them. Stops once the busy file is cleared (reply landed) or a cooldown
-  // window has been written (we already sent something).
+  // After the first (soft) reminder, re-fires every FLEET_REMIND_ESCALATE_MS
+  // (default 90s) with a hard reminder until reply() is called.
+  // Ladder: soft@90s, hard@180s, hard@270s, hard@360s, ... (every 90s).
+  // Reminders route through the local mcp connection only — peer sessions never
+  // see them. Stops once the busy file is cleared (reply landed) or cooldownUntil
+  // is set (we already sent something).
   setInterval(() => {
     const b = fleetReadBusy(FLEET_SESSION)
     if (!b) return
@@ -513,10 +562,12 @@ if (FLEET_SESSION) {
     const lastRem = b.lastReminderAt ?? 0
     const sinceLastRem = Date.now() - lastRem
     let level: 'soft' | 'hard' | undefined
-    if (age >= FLEET_REMIND_ESCALATE_MS && sinceLastRem >= FLEET_REMIND_ESCALATE_MS) {
-      level = 'hard'
-    } else if (age >= FLEET_REMIND_AFTER_MS && lastRem === 0) {
+    if (age >= FLEET_REMIND_AFTER_MS && lastRem === 0) {
+      // First reminder: soft
       level = 'soft'
+    } else if (lastRem > 0 && sinceLastRem >= FLEET_REMIND_ESCALATE_MS) {
+      // All subsequent re-fires: hard (every FLEET_REMIND_ESCALATE_MS = 90s)
+      level = 'hard'
     }
     if (!level) return
     const text = level === 'hard'
@@ -542,10 +593,10 @@ if (FLEET_SESSION) {
 
   // Graceful code-roll: every 30s, check if our own source on disk has
   // been replaced (fleet-sync rewriting it). When idle, exit so the outer
-  // bash restart loop (in package.json start script) relaunches bun with the
+  // bash restart loop (in package.json start script) relaunches node with the
   // new code within ~0.5s. The restart loop holds the MCP pipe open so
   // Claude Code never sees a disconnect.
-  const FLEET_SOURCE_PATH = import.meta.path
+  const FLEET_SOURCE_PATH = fileURLToPath(import.meta.url)
   let FLEET_SOURCE_MTIME = 0
   try { FLEET_SOURCE_MTIME = statSync(FLEET_SOURCE_PATH).mtimeMs } catch {}
   setInterval(() => {
@@ -558,7 +609,7 @@ if (FLEET_SESSION) {
     if (selfBusy && (!selfBusy.cooldownUntil || Date.now() < selfBusy.cooldownUntil)) return
     process.stderr.write(`[fleet] source changed (mtime ${FLEET_SOURCE_MTIME} → ${m}); exiting for restart loop\n`)
     // Exit so the outer restart loop (in package.json start script) immediately
-    // relaunches bun with the new code. The restart loop keeps Claude Code's
+    // relaunches node with the new code. The restart loop keeps Claude Code's
     // MCP pipe alive across the restart — no supervisor dependency.
     process.exit(0)
   }, 30_000).unref()
@@ -587,14 +638,13 @@ function noteSent(id: string): void {
   }
 }
 
-// Typing indicator loop — keeps "Herc is typing..." visible while processing.
+// Typing indicator loop — keeps "Bot is typing..." visible while processing.
 // Uses direct REST calls (not discord.js channel object) to avoid stale reference issues.
 // Discord typing indicator lasts ~10s; we refresh every 8s to stay continuous.
 const typingIntervals = new Map<string, ReturnType<typeof setInterval>>()
 
 function sendTypingREST(channelId: string): void {
   try {
-    const https = require('https') as typeof import('https')
     const req = https.request({
       hostname: 'discord.com',
       path: `/api/v10/channels/${channelId}/typing`,
@@ -828,7 +878,10 @@ function safeAttName(att: Attachment): string {
 // The claiming session needs two things to "enter the channel": recent Discord
 // messages (live, transient) and persistent channel memory (written by prior
 // sessions). Both are looked up from slug → discord channel name.
-const CHANNEL_MEMORY_DIR = '/workspace/memory/channels'
+//
+// CHANNEL_MEMORY_DIR: directory where per-channel markdown memory files live.
+// Default: ~/.claude/channels  (portable; override with CHANNEL_MEMORY_DIR env var)
+const CHANNEL_MEMORY_DIR = process.env.CHANNEL_MEMORY_DIR ?? join(homedir(), '.claude', 'channels')
 
 function channelSlug(msg: Message): string {
   const ch = msg.channel as { name?: string; isDMBased?: () => boolean }
@@ -1158,6 +1211,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const ch = await fetchAllowedChannel(chat_id)
         if (!('send' in ch)) throw new Error('channel is not sendable')
 
+        // Renew typing indicator on every progress update — belt-and-suspenders
+        // alongside the 8s keepalive interval. Prevents the indicator from
+        // expiring during long gaps between tool calls.
+        sendTypingREST(chat_id)
+
         const existingId = activeWorkingMsg.get(chat_id)
         if (existingId) {
           try {
@@ -1333,17 +1391,37 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
-  // Trivial-message classifier: drops greetings, acks, and emoji-only
-  // replies before the fleet claim. Reacts with an emoji and returns —
-  // saves the cost of a Claude session spin just to say "👍". Conservative
-  // by design: when in doubt, falls through and lets the model see it.
+  // Trivial-message classifier: an ack ("ok", "thanks") or pure-emoji reply
+  // gets a reaction and skips the model spin entirely. Conservative on
+  // purpose — any ambiguity falls through to the model.
+  //
+  // Not fleet-claimed: the classification is deterministic so all peer
+  // sessions agree on "trivial" and react in parallel; Discord dedupes
+  // reactions. Cheaper than the fleet race for the common ack case.
+  // (Same pattern as the permission-reply intercept above.)
   const trivial = classifyTrivial({
     content: msg.content,
     hasAttachments: msg.attachments.size > 0,
     hasMentions: msg.mentions.users.size > 0 || msg.mentions.roles.size > 0,
   })
-  if (trivial.trivial) {
-    if (trivial.reaction) void msg.react(trivial.reaction).catch(() => {})
+  if (trivial.trivial && trivial.reaction) {
+    void msg.react(trivial.reaction).catch(() => {})
+    process.stderr.write(`discord channel: trivial-classifier handled inbound (${trivial.reason})\n`)
+    // Optional channel-memory note hook.
+    // Set FLEET_TRIVIAL_NOTE_HOOK to the absolute path of a Node script that
+    // accepts args: <slug> <summary-text>
+    // It will be spawned detached+unref'd so the bot never blocks on it.
+    // Example: FLEET_TRIVIAL_NOTE_HOOK=/path/to/note-template.js
+    // Disabled by default (no-op if unset).
+    const noteHook = process.env.FLEET_TRIVIAL_NOTE_HOOK
+    if (noteHook) {
+      const slug = channelSlug(msg)
+      spawn('node', [
+        noteHook,
+        slug,
+        `Trivial-handled inbound from ${msg.author.username}: "${msg.content.slice(0, 60)}" → reacted ${trivial.reaction} (${trivial.reason})`,
+      ], { detached: true, stdio: 'ignore' }).unref()
+    }
     return
   }
 
@@ -1363,7 +1441,7 @@ async function handleInbound(msg: Message): Promise<void> {
     user: msg.author.username,
   })
 
-  // Typing indicator loop — keeps "Herc is typing..." visible throughout processing.
+  // Typing indicator loop — keeps "Bot is typing..." visible throughout processing.
   startTyping(chat_id)
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
@@ -1389,7 +1467,7 @@ async function handleInbound(msg: Message): Promise<void> {
   // this channel" briefing. Two sources, stacked:
   //   1. channel_history: last ~5 Discord messages before this one (transient,
   //      fetched live each time — no cache to get stale).
-  //   2. channel_memory: /workspace/memory/channels/<slug>.md if present
+  //   2. channel_memory: CHANNEL_MEMORY_DIR/<slug>.md if present
   //      (durable — sessions update it on reply so the next claimer picks up
   //      the thread even days later).
   // Both are best-effort: a fetch failure or missing memory file doesn't
@@ -1424,6 +1502,101 @@ async function handleInbound(msg: Message): Promise<void> {
   // message in the channel prefers us (stickiness). Best-effort; failure
   // here doesn't block delivery (we've already notified Claude).
   fleetUpdateStickiness(chat_id)
+}
+
+// ---------------------------------------------------------------------------
+// Voice feature — DISABLED by default.
+// Set DISCORD_VOICE_ENABLED=1 in the container env to activate.
+//
+// Safety guarantee: with DISCORD_VOICE_ENABLED unset (or any value ≠ '1'),
+// the voice modules (voice.ts, stt.ts, tts.ts) are NEVER imported — dynamic
+// import is inside the enabled branch only. The text/MCP path is completely
+// unaffected whether voice is off OR if the import fails.
+// ---------------------------------------------------------------------------
+const VOICE_ENABLED = process.env.DISCORD_VOICE_ENABLED === '1'
+
+if (VOICE_ENABLED) {
+  // Dynamic import so the module (and its @discordjs/voice / prism-media deps)
+  // are only loaded when explicitly opted in. Wrapped in try/catch so any
+  // import failure (missing native module, etc.) logs and falls back gracefully
+  // without killing the text path.
+  client.once('ready', async () => {
+    try {
+      const { VoiceManager } = await import('./voice.js')
+      const voiceMgr = new VoiceManager({
+        client,
+        onTranscript: async ({ text, chatId }) => {
+          // Inject the transcript as a synthetic inbound Discord notification
+          // so the MCP/Claude layer sees it exactly like a text message.
+          try {
+            await mcp.notification({
+              method: 'notifications/claude/channel',
+              params: {
+                content: `[voice] ${text}`,
+                meta: {
+                  chat_id: chatId,
+                  message_id: `voice-${Date.now()}`,
+                  user: 'voice',
+                  ts: new Date().toISOString(),
+                  channel_slug: 'voice',
+                  channel_memory_path: `${CHANNEL_MEMORY_DIR}/voice.md`,
+                  instructions: 'This is a voice transcript. Reply concisely — the reply will be spoken aloud.',
+                },
+              },
+            })
+          } catch (err) {
+            process.stderr.write(`fleet-discord: voice MCP notify failed: ${err}\n`)
+          }
+        },
+      })
+
+      // Slash-command handler for /voice join|leave|mode
+      client.on('interactionCreate', async interaction => {
+        if (!interaction.isChatInputCommand()) return
+        if (interaction.commandName !== 'voice') return
+
+        const sub = interaction.options.getSubcommand(false)
+        try {
+          await interaction.deferReply({ ephemeral: true })
+          let reply: string
+          if (sub === 'join') {
+            reply = await voiceMgr.joinFromInteraction(interaction)
+          } else if (sub === 'leave') {
+            const guildId = voiceMgr.guildIdForChat(interaction.channelId)
+            reply = voiceMgr.leave(guildId ?? undefined)
+          } else if (sub === 'mode') {
+            const guildId = voiceMgr.guildIdForChat(interaction.channelId)
+            const modeArg = interaction.options.getString('mode', false) as 'full' | 'listen' | null
+            if (!modeArg) {
+              reply = voiceMgr.modeStatus(guildId)
+            } else {
+              if (!guildId) {
+                reply = 'Not connected to voice. Use /voice join first.'
+              } else {
+                reply = voiceMgr.setMode(guildId, modeArg)
+              }
+            }
+          } else {
+            reply = 'Unknown subcommand. Use /voice join, /voice leave, or /voice mode.'
+          }
+          await interaction.editReply(reply)
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          process.stderr.write(`fleet-discord: /voice command error: ${msg}\n`)
+          try { await interaction.editReply(`Voice error: ${msg}`) } catch {}
+        }
+      })
+
+      // Graceful shutdown: destroy voice connections when plugin exits
+      process.on('exit', () => voiceMgr.shutdown())
+      process.stderr.write('fleet-discord: voice feature enabled (DISCORD_VOICE_ENABLED=1)\n')
+    } catch (err) {
+      // Import or init failure — log and continue. The text MCP path is unaffected.
+      process.stderr.write(`fleet-discord: voice init failed (non-fatal, text path unaffected): ${err}\n`)
+    }
+  })
+} else {
+  process.stderr.write('fleet-discord: voice feature disabled (set DISCORD_VOICE_ENABLED=1 to enable)\n')
 }
 
 client.once('ready', c => {

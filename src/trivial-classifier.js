@@ -5,10 +5,10 @@
  * emoji-only reply, or some other message where the right response is a
  * lightweight reaction rather than a full Claude session spin.
  *
- * Used by server.ts before the fleet claim. If a message is classified
- * trivial, the bot reacts with the suggested emoji and skips the
- * `notifications/claude/channel` MCP call entirely — saving the cost of
- * loading a full session just to say "👍".
+ * Used by fleet-discord-server.ts before the fleet claim. If a message is
+ * classified trivial, the bot reacts with the suggested emoji and skips
+ * the `notifications/claude/channel` MCP call entirely — saving the cost
+ * of loading a full session just to say "👍".
  *
  * Conservative on purpose: when in doubt, return trivial=false so the
  * model still sees the message. The cost of a missed model spin is much

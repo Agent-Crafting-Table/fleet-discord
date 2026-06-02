@@ -3,8 +3,10 @@
 #   1. boot-time sync of the canonical fleet server.ts into all session
 #      plugin dirs (so a freshly-rebuilt container picks up your edits)
 #   2. a 5-minute watchdog tmux window that re-runs the sync and bounces
-#      the bun plugin processes whenever the canonical file changes
+#      the Node plugin processes whenever the canonical file changes
 #   3. one fleet supervisor per session
+#
+# Runtime: Node 22+ / tsx (NOT bun). Run `npm install` in src/ first.
 #
 # Adapt FLEET_KIT_DIR and the per-session env vars to your layout.
 # Each fleet session needs its own CLAUDE_CONFIG_DIR; the DISCORD_BOT_TOKEN
@@ -29,14 +31,14 @@ export FLEET_SESSION_DIRS="$HOME/.claude $HOME/.claude-node-b $HOME/.claude-node
 echo "[fleet] syncing canonical server.ts into session plugin dirs..."
 bash "$FLEET_KIT_DIR/src/fleet-sync-plugin.sh" || true
 
-# 2) Watchdog — re-syncs every 5 minutes. Each fleet bun watches its own
-#    source mtime and self-exits when idle if it changed, so the watchdog
+# 2) Watchdog — re-syncs every 5 minutes. Each fleet Node process watches its
+#    own source mtime and self-exits when idle if it changed, so the watchdog
 #    only needs to replace files on disk; the MCP supervisor respawns each
-#    bun cleanly into the new code. No pkill (the old kill-blast approach
-#    left the supervisor unable to respawn). Lives in its own tmux window
-#    (assumes a session named "claude" already exists).
+#    Node process cleanly into the new code. No pkill (the old kill-blast
+#    approach left the supervisor unable to respawn). Lives in its own tmux
+#    window (assumes a session named "claude" already exists).
 tmux new-window -t claude -n fleet-sync \
-  "while true; do bash \"$FLEET_KIT_DIR/src/fleet-sync-plugin.sh\"; rc=\$?; if [ \$rc -eq 2 ]; then echo '[fleet-sync] content changed — fleet bun procs will self-respawn when idle'; fi; sleep 300; done"
+  "while true; do bash \"$FLEET_KIT_DIR/src/fleet-sync-plugin.sh\"; rc=\$?; if [ \$rc -eq 2 ]; then echo '[fleet-sync] content changed — fleet Node procs will self-respawn when idle'; fi; sleep 300; done"
 
 # 3) Per-session supervisors. One window per fleet session.
 #    Each session needs FLEET_SESSION_NAME + CLAUDE_CONFIG_DIR + DISCORD_STATE_DIR.

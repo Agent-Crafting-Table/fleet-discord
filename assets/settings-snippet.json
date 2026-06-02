@@ -1,0 +1,29 @@
+{
+  "_comment": "Snippet showing how to wire the PreToolUse tool-stream hook in a Claude Code settings.json.",
+  "_instructions": [
+    "Copy the 'hooks' block into your ~/.claude/settings.json (or per-project .claude/settings.json).",
+    "Adjust the path to discord-tool-notify.js to wherever you installed fleet-discord.",
+    "The hook fires before every tool call. It exits 0 immediately unless DISCORD_TOOL_STREAM=1",
+    "is set (either in process env or in your plugin .env file), and unless the session has an",
+    "active busy file (i.e. it's currently handling a Discord message). This means it's silent",
+    "during all non-Discord work — no overhead for regular sessions.",
+    "",
+    "To enable streaming for a session, add DISCORD_TOOL_STREAM=1 to:",
+    "  $CLAUDE_CONFIG_DIR/channels/discord/.env",
+    "(the same .env that holds DISCORD_BOT_TOKEN)"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /path/to/fleet-discord/src/discord-tool-notify.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
